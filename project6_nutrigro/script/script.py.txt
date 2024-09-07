@@ -1,0 +1,161 @@
+# Import necessary libraries
+import pandas as pd
+import numpy as np
+import os
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error
+import matplotlib.pyplot as plt
+import seaborn as sns
+from keras.applications import ResNet50
+from keras.applications.resnet50 import preprocess_input
+from keras.preprocessing import image
+from keras.models import Model
+from sklearn.neighbors import NearestNeighbors
+from sklearn.metrics.pairwise import cosine_similarity
+import warnings
+warnings.filterwarnings('ignore')
+# Load core data CSV files
+core_recipe = pd.read_csv('core-data_recipe.csv')
+core_train_rating = pd.read_csv('core-data-train_rating.csv')
+core_valid_rating = pd.read_csv('core-data-valid_rating.csv')
+core_test_rating = pd.read_csv('core-data-test_rating.csv')
+
+# Load raw data CSV files
+raw_recipe = pd.read_csv('raw-data_recipe.csv')
+raw_interaction = pd.read_csv('raw-data_interaction.csv')
+
+# Check data loading
+print(core_recipe.head())
+print(core_train_rating.head())
+# Handle missing values in core recipe data
+core_recipe.fillna('Unknown', inplace=True)
+
+# Ensure ratings are in correct format
+core_train_rating['rating'] = core_train_rating['rating'].astype(float)
+core_valid_rating['rating'] = core_valid_rating['rating'].astype(float)
+core_test_rating['rating'] = core_test_rating['rating'].astype(float)
+
+# Drop rows with missing values in training data
+core_train_rating.dropna(inplace=True)
+#  Image Feature Extraction using Pre-trained CNN (ResNet50)
+
+# Load pre-trained ResNet50 model
+resnet_model = ResNet50(weights='imagenet', include_top=False, pooling='avg')
+
+# Function to extract image features
+def extract_image_features(img_path):
+    img = image.load_img(img_path, target_size=(224, 224))
+    img_data = image.img_to_array(img)
+    img_data = np.expand_dims(img_data, axis=0)
+    img_data = preprocess_input(img_data)
+    features = resnet_model.predict(img_data)
+    return features.flatten()
+
+# Paths to image folders
+core_image_folder = "C:\\Users\\home\\Desktop\\Untitled Folder\\nutrigro\\core-data-images\\core-data-images"
+raw_image_folder = "C:\\Users\\home\\Desktop\\Untitled Folder\\nutrigro\\raw-data-images\\raw-data-images"
+
+# Extract features for core data images
+core_recipe['image_features'] = core_recipe['recipe_id'].apply(lambda x: extract_image_features(os.path.join(core_image_folder, f"{x}.jpg")))
+
+# Extract features for raw data images (if needed)
+raw_recipe['image_features'] = raw_recipe['recipe_id'].apply(lambda x: extract_image_features(os.path.join(raw_image_folder, f"{x}.jpg")))
+# Merge core recipe data with training rating data
+train_data = pd.merge(core_train_rating, core_recipe, on='recipe_id')
+
+# Build user-item interaction matrix
+interaction_matrix = train_data.pivot_table(index='user_id', columns='recipe_id', values='rating').fillna(0)
+
+# Using KNN for collaborative filtering
+knn = NearestNeighbors(metric='cosine', algorithm='brute')
+knn.fit(interaction_matrix.values)
+
+# Function to recommend recipes using KNN (Collaborative Filtering)
+def recommend_recipes(user_id, num_recommendations=5):
+    user_index = interaction_matrix.index.get_loc(user_id)
+    distances, indices = knn.kneighbors([interaction_matrix.iloc[user_index, :].values], n_neighbors=num_recommendations+1)
+    recommended_recipes = interaction_matrix.columns[indices.flatten()].tolist()[1:]
+    return recommended_recipes
+
+# Example: Recommend top 5 recipes for a specific user
+user_id = 12345  # Replace with actual user_id
+recommendations = recommend_recipes(user_id, 5)
+print("Top recommendations for user:", recommendations)
+# Combine image features with other recipe attributes (e.g., ingredients)
+combined_features = pd.concat([pd.DataFrame(core_recipe['image_features'].tolist()), core_recipe['ingredients']], axis=1)
+
+# Create a similarity matrix using combined features
+similarity_matrix = cosine_similarity(combined_features)
+
+# Function to recommend recipes based on similarity (image + ingredients)
+def recommend_with_images(recipe_id, num_recommendations=5):
+    idx = core_recipe[core_recipe['recipe_id'] == recipe_id].index[0]
+    similarity_scores = list(enumerate(similarity_matrix[idx]))
+    similarity_scores = sorted(similarity_scores, key=lambda x: x[1], reverse=True)
+    recommended_recipes = [core_recipe['recipe_id'].iloc[i[0]] for i in similarity_scores[1:num_recommendations+1]]
+    return recommended_recipes
+
+# Example: Recommend recipes based on both text and image features
+recipe_id_example = 123  # Replace with an actual recipe_id
+recommended_recipes_with_images = recommend_with_images(recipe_id_example)
+print("Top recommendations (with images):", recommended_recipes_with_images)
+# Function to calculate RMSE
+def get_rmse(predictions, true_values):
+    return np.sqrt(mean_squared_error(predictions, true_values))
+
+# Predict ratings for the test set
+def predict_ratings(user_id, recipe_id):
+    recommended_recipes = recommend_recipes(user_id, 5)
+    if recipe_id in recommended_recipes:
+        return 5.0  # High rating for recommended recipes
+    else:
+        return 3.0  # Lower rating for non-recommended recipes
+
+# Calculate RMSE on the test data
+predictions = []
+true_values = []
+
+for _, row in core_test_rating.iterrows():
+    user_id = row['user_id']
+    recipe_id = row['recipe_id']
+    true_rating = row['rating']
+    
+    predicted_rating = predict_ratings(user_id, recipe_id)
+    predictions.append(predicted_rating)
+    true_values.append(true_rating)
+
+# Compute RMSE
+rmse_value = get_rmse(predictions, true_values)
+print(f"RMSE for the recommendation model: {rmse_value}")
+
+from sklearn.ensemble import RandomForestRegressor
+
+# Use nutrition data to predict healthiness (as a proxy: predict rating)
+nutrition_features = ['calories', 'protein', 'fat', 'carbohydrates']  # Example columns
+X = core_recipe[nutrition_features]
+y = core_recipe['rating']
+
+# Split into train and test sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train RandomForest model
+health_model = RandomForestRegressor()
+health_model.fit(X_train, y_train)
+
+# Predict and evaluate the model
+y_pred = health_model.predict(X_test)
+health_rmse = get_rmse(y_pred, y_test)
+print(f"Healthiness Model RMSE: {health_rmse}")
+
+from sklearn.model_selection import GridSearchCV
+
+# Define a grid for KNN hyperparameter tuning
+param_grid = {'n_neighbors': [3, 5, 10, 20]}
+
+# Use GridSearchCV to find the best parameters
+grid_search = GridSearchCV(knn, param_grid, cv=3, scoring='neg_mean_squared_error')
+grid_search.fit(interaction_matrix.values)
+
+# Output best parameters
+print(f"Best parameters for KNN: {grid_search.best_params_}")
